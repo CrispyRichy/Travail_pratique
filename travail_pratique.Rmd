@@ -1,0 +1,226 @@
+---
+title: "Modélisation et prédiction du prix des Airbnb au Québec"
+author: "Alexandre Richard"
+date: "29/07/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(corrplot)
+library(RColorBrewer)
+library(dismo)
+library(ranger)
+
+```
+
+
+## Chargement des données
+
+```{r loading_data}
+data <- read.csv("listings.csv",encoding = "UTF-8")
+```
+
+## Traitement de données
+
+Suppression de variables non utiles.
+
+```{r data processing}
+data <- data[,c(30:34,36:38,40:42,56,61:67)]
+```
+
+Exploration de données.
+
+```{r}
+summary(data$longitude)
+summary(data$latitude)
+table(data$property_type) # Beaucoup trop de classes
+table(data$room_type)
+summary(data$accommodates)
+table(data$bathrooms_text)
+summary(data$bedrooms) # 332 données manquantes
+summary(data$beds) # 21 données manquantes
+table(data$price)
+summary(data$minimum_nights)
+summary(data$maximum_nights)
+summary(data$number_of_reviews)
+summary(data$review_scores_rating) # 476 données manquantes
+summary(data$review_scores_accuracy) # 491 données manquantes
+summary(data$review_scores_cleanliness) # 491 données manquantes
+summary(data$review_scores_checkin) # 491 données manquantes
+summary(data$review_scores_communication) # 491 données manquantes
+summary(data$review_scores_location) # 491 données manquantes
+summary(data$review_scores_value) # 491 données manquantes
+
+```
+
+
+Suppression du signe "$" dans le prix et transformation en numérique
+
+```{r}
+data$price <- sub(".","",data$price)
+data$price <- gsub(",","",data$price)
+data$price <- as.numeric(data$price)
+```
+
+Visualisation de la distribution du prix.
+
+```{r}
+boxplot(data$price)
+test <- boxplot(data$price)
+min(test$out) 
+# Le boxplot recommande de rejeter toutes observations d'au moins 350, il s'agit de données extrêmes.
+
+data <- data[which(data$price < 350),]
+hist(data$price) # Transformation par le logarithme pourrait être utile.
+hist(log(data$price))
+```
+
+Vérification entre la corrélation des variables numériques.
+
+
+```{r}
+correlation <-cor(data[,c(1,2,5,7:19)],use = "pairwise.complete.obs")
+corrplot(correlation, type="upper", order="hclust",
+         col=brewer.pal(n=8, name="RdYlBu"))
+# Légère corrélation entre le prix et certaines variables (Nombre de chambres, nombre de lits et nombre de personnes accueillies)
+```
+
+Regroupement du nombre de salles de bains en 3 catégories pour faciliter l'utilisation de la variable, sois : 1 et moins, ]1,2], plus de 2.
+```{r}
+table(data$bathrooms_text)
+data$bathrooms_text <- ifelse(data$bathrooms_text == "Half-bath",0.5,vapply(strsplit(data$bathrooms_text," "), `[`, 1, FUN.VALUE=character(1)))
+
+data$bathrooms_text <- cut(as.numeric(data$bathrooms_text),breaks = c(0,1,2,Inf),
+                           labels = c("1 et moins","]1,2]","plus de 2"))
+table(data$bathrooms_text)
+
+```
+
+# Préparation des jeux de données
+
+Suppression des données manquantes et séparation en jeu d'entrainement et de test 80/20.
+```{r}
+data <- data[complete.cases(data[,-3]),-3]
+set.seed(42)
+sample <- sample(length(data[,1]),0.8*length(data[,1]))
+train <- data[sample,]
+test <- data[-sample,]
+
+```
+
+Création d'une fonction min/max pour normaliser les données numériques selon le jeu d'entrainement.
+
+```{r}
+min_max <- function(column_index_to_scale,df,df_use_to_scale){
+  for (index in column_index_to_scale){
+    min <- min(df_use_to_scale[,index],na.rm = T)
+    max <- max(df_use_to_scale[,index],na.rm = T)
+    scaled <-  (df[,index]-min)/(max-min)
+    df[,index] <- scaled
+  }
+  return(df)
+}
+test <- min_max(c(1,2,4,6,7,9:18),test,train)
+train <- min_max(c(1,2,4,6,7,9:18),train,train)
+
+```
+
+Création d'index pour effectuer une validation croisée avec 10 folder lors de l'entrainement.
+
+```{r}
+set.seed(42)
+index <- kfold(train,10)
+```
+
+# Modélisation d'une forêt aléatoire 
+
+Effectuée en utilisant la RMSE(Root mean squared error) pour choisir les hyperparamètres selon une recherche par grille. L'optimisation est fait pour le choix du nombre d'arbres, de la profondeur maximale et du critère de séparation des arbres.
+```{r}
+
+min_rmse <- Inf
+info <- c()
+for (i in seq(1,15,1)){
+  for (j in seq(1,701,50)){
+    for (split in c("extratrees","variance")){
+      rmse_pred <- NULL
+      for (k in 1:10){
+        list <- which(index == k)
+          
+        model <- ranger(price ~ .,data = train[-list,], num.trees = j,
+                           max.depth = i,importance = "impurity", splitrule = split )
+        
+        prediction<- predict(model,train[list,])$predictions
+        
+        rmse_pred <- c(rmse_pred,round(sqrt(mean((prediction-train$price[list])^2)),4))
+        
+      }
+      
+      rmse_mat <- mean(rmse_pred)
+      if (rmse_mat < min_rmse){
+        info <- c(i,j,split,rmse_mat)
+        min_rmse <- rmse_mat
+      }
+    }
+  }
+}
+# Résultats obtenus : max.depth = 13, num.trees = 251, splitrule = variance
+
+```
+
+Modèle final
+
+```{r}
+set.seed(42)
+model <- ranger(price ~ .,data = train, num.trees = 251,
+                           max.depth = 13,importance = "impurity", splitrule = "variance")
+
+importance <- as.data.frame(ranger::importance(model))
+
+
+#Vérification pour trouver le meilleur modèle en supprimant tour à tour les variables moins importantes
+
+min_rmse <- Inf
+last_feature <- c("latitude")
+for (tresh in seq(0,0.15,0.00001)){
+  feature <- rownames(importance)[which((importance[,1])/sum(importance[,1]) > tresh)]
+  if (length(feature) == length(last_feature) || length(feature) < 1){
+    next()
+  }
+  last_feature <- feature
+  for (forest in 1:5){
+    model_test <- ranger(price ~ .,data = train[,c(feature,"price")], num.trees = 251,
+                      max.depth = 13,importance = "impurity", splitrule = "variance")
+    
+    prediction <- predict(model_test,test)$prediction
+    if (sqrt(mean((prediction-test$price)^2)) < min_rmse ){
+      model <- model_test
+      min_rmse <- sqrt(mean((prediction-test$price)^2))
+    }
+    
+  }
+}
+
+prediction <- predict(model,test)$prediction
+
+plot(prediction,test$price,xlab ="Prédictions",ylab = "Ground truth",
+     main = "Comparaison entre les prédictions du modèle et les vrais prix")
+legend("topleft", legend=c(paste0("RMSE : ",round(sqrt(mean((prediction-test$price)^2)),3)),
+                             paste0("Corrélation : ",round(cor(prediction,test$price),3))),pt.cex = 1,cex = 0.7,bty = "n")
+lines(-1000:100000,-1000:100000,col ="red")
+legend("bottomright",legend = "Perfect fit",lty = 1,col = "red")
+```
+
+# Analyse 
+
+On remarque que la longitude et la latitude sont les variables les plus importantes pour prédire le prix. On gagnerait peut-être à faire du clustering sur ces données. De plus, on semble tendre à surestimer les locations avec les prix les plus faibles, c'est souvent ce qui arrive lorsque la distribution est de forme log-normale. Le modèle pourrait sans doute être amélioré, mais on y retrouve déjà une corrélation respectable entre les prédictions et les vrais prix.
+
+```{r}
+print(importance)
+```
+
+
+
